@@ -1,0 +1,196 @@
+"""
+Reinforcement Learning Policy Network (RLPN)
+MDP formulation for adaptive defense strategy selection.
+
+State:  s_t = [z; v_t] ∈ ℝ^{d_fuse+16}
+Actions: a₁–a₅ (5 defense strategies)
+Reward: R(s,a) = ACC_clean + β·ΔACC_adv − γ_c·C(a)
+Update: REINFORCE with learned exponential moving average baseline
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import Optional
+
+
+# Action cost constants (from Section 4.6)
+ACTION_COSTS = {
+    0: 0.05,   # a1: augmentation only (cheapest)
+    1: 0.10,   # a2: denoising + augmentation
+    2: 0.20,   # a3: ensemble voting (3 models)
+    3: 0.80,   # a4: certified smoothing M=100 (most expensive)
+    4: 0.15,   # a5: graph structure regularisation
+}
+
+ACTION_NAMES = {
+    0: "Augmentation only (K=3 perturbed copies)",
+    1: "Denoising + Augmentation (2-layer MLP denoiser)",
+    2: "Ensemble voting (3 random seed models)",
+    3: "Certified smoothing (M=100, σ=0.25)",
+    4: "Graph structure regularisation (τ_edge=0.5)",
+}
+
+
+class RLPolicyNetwork(nn.Module):
+    """
+    RLPN: Two-layer MLP policy for defense action selection.
+
+    Architecture: 528 → 128 → 5
+        where 528 = d_fuse (256) + attack signature dim (16) + padding (256)
+
+    Attack signature v_t ∈ ℝ^16 encodes:
+        1. Token perturbation magnitude |δ_tok|₂ / ε₁
+        2. Sentence perturbation magnitude |δ_sent|₂ / ε₂
+        3. Graph edit distance k / k_max
+        4. Relative confidence drop (p_clean[c*] − p_adv[c*]) / p_clean[c*]
+    (projected ℝ⁴ → ℝ^16 via linear projection)
+
+    Args:
+        state_dim (int): Input state dimension. Default: 528.
+        hidden_dim (int): Hidden layer dimension. Default: 128.
+        num_actions (int): Number of defense actions. Default: 5.
+        eps_start (float): Initial ε for ε-greedy. Default: 1.0.
+        eps_end (float): Final ε. Default: 0.05.
+        eps_decay_steps (int): Decay steps. Default: 10 epochs * steps_per_epoch.
+    """
+
+    def __init__(
+        self,
+        state_dim: int = 528,
+        hidden_dim: int = 128,
+        num_actions: int = 5,
+        eps_start: float = 1.0,
+        eps_end: float = 0.05,
+        eps_decay_steps: int = 5000,
+    ):
+        super().__init__()
+        self.num_actions = num_actions
+        self.eps_start = eps_start
+        self.eps_end = eps_end
+        self.eps_decay_steps = eps_decay_steps
+        self._step = 0
+
+        # Policy network: 2-layer MLP
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, num_actions)
+
+        # Exponential moving average baseline: b_{t+1} = 0.99·b_t + 0.01·R_t
+        self.register_buffer("baseline", torch.zeros(1))
+        self.baseline_decay = 0.99
+
+        # Attack signature projection: ℝ⁴ → ℝ^16
+        self.sig_proj = nn.Linear(4, 16)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.orthogonal_(self.fc1.weight, gain=1.0)
+        nn.init.orthogonal_(self.fc2.weight, gain=0.01)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.zeros_(self.fc2.bias)
+
+    @property
+    def epsilon(self) -> float:
+        """Current ε for ε-greedy exploration (linear decay)."""
+        progress = min(self._step / self.eps_decay_steps, 1.0)
+        return self.eps_start + progress * (self.eps_end - self.eps_start)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Compute action logits from state.
+
+        Args:
+            state: (B, state_dim)
+
+        Returns:
+            logits: (B, num_actions)
+        """
+        x = F.relu(self.fc1(state))
+        logits = self.fc2(x)
+        return logits
+
+    def select_action(
+        self,
+        state: torch.Tensor,
+        deterministic: bool = False,
+    ) -> torch.Tensor:
+        """
+        Select defense action via ε-greedy policy.
+
+        Args:
+            state: (B, state_dim)
+            deterministic: If True, always pick argmax (no exploration).
+
+        Returns:
+            action: (B,) integer action indices
+        """
+        logits = self.forward(state)
+        probs = F.softmax(logits, dim=-1)
+
+        if deterministic or np.random.random() > self.epsilon:
+            action = probs.argmax(dim=-1)
+        else:
+            action = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+        self._step += 1
+        return action
+
+    def compute_loss(
+        self,
+        log_probs: torch.Tensor,
+        rewards: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        REINFORCE policy gradient loss with EMA baseline.
+
+        ∇_φ J(φ) = E_τ [Σ_t ∇_φ log π_φ(a_t|s_t) · (R_t − b_t)]
+
+        Args:
+            log_probs: (T,) log π_φ(a_t|s_t)
+            rewards: (T,) R_t per step
+
+        Returns:
+            loss: scalar policy gradient loss (negated for gradient ascent)
+        """
+        # Update EMA baseline
+        mean_reward = rewards.mean().detach()
+        self.baseline = (
+            self.baseline_decay * self.baseline +
+            (1.0 - self.baseline_decay) * mean_reward
+        )
+
+        advantages = rewards - self.baseline
+        loss = -(log_probs * advantages.detach()).mean()
+        return loss
+
+    def update_baseline(self, reward: float):
+        """Update EMA baseline with scalar reward."""
+        self.baseline = (
+            self.baseline_decay * self.baseline +
+            (1.0 - self.baseline_decay) * reward
+        )
+
+    def encode_attack_signature(
+        self,
+        token_mag: torch.Tensor,
+        sent_mag: torch.Tensor,
+        graph_edit: torch.Tensor,
+        conf_drop: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Build 16-dim attack signature vector v_t.
+
+        Args:
+            token_mag: |δ_tok|₂ / ε₁, shape (B,)
+            sent_mag: |δ_sent|₂ / ε₂, shape (B,)
+            graph_edit: k / k_max, shape (B,)
+            conf_drop: (p_clean[c*] - p_adv[c*]) / p_clean[c*], shape (B,)
+
+        Returns:
+            v_t: (B, 16)
+        """
+        raw = torch.stack([token_mag, sent_mag, graph_edit, conf_drop], dim=-1)
+        v_t = self.sig_proj(raw)   # (B, 16)
+        return v_t
