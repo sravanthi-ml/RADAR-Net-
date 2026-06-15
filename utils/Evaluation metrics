@@ -1,0 +1,15 @@
+"""Evaluation metrics for RADAR-Net."""
+
+from sklearn.metrics import accuracy_score, f1_score, classification_report
+from typing import List, Dict
+
+
+def compute_metrics(preds: List[int], labels: List[int]) -> Dict:
+    acc = accuracy_score(labels, preds)
+    macro_f1 = f1_score(labels, preds, average="macro")
+    return {
+        "accuracy": round(acc * 100, 2),
+        "macro_f1": round(macro_f1 * 100, 2),
+        "report": classification_report(labels, preds,
+                                        target_names=["non-rumour", "rumour"]),
+    }
