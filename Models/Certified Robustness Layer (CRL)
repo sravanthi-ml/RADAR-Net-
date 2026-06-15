@@ -1,0 +1,104 @@
+"""
+Certified Robustness Layer (CRL)
+Lipschitz certification via spectral normalisation and per-sample radius.
+
+Theorem 2: If σ(W_l) ≤ 1 for all l and
+    F_θ(X,G)[c*] - max_{c≠c*} F_θ(X,G)[c] > 2ε
+then the classification is certifiably preserved under any
+‖(δ, ΔA)‖₂ ≤ ε perturbation.
+
+Certified radius:
+    ε_cert(X,G) = (F_θ[c*] - max_{c≠c*} F_θ[c]) / 2 = margin / 2
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class CertifiedRobustnessLayer(nn.Module):
+    """
+    CRL: Computes per-sample certified robustness radii.
+
+    Does NOT add any parameters — it is a constraint enforcement
+    mechanism and a certificate computation utility.
+
+    Args:
+        sigma_target (float): Spectral norm upper bound. Default: 1.0.
+        eps_threshold (float): CRR threshold. Default: 0.05.
+    """
+
+    def __init__(self, sigma_target: float = 1.0, eps_threshold: float = 0.05):
+        super().__init__()
+        self.sigma_target = sigma_target
+        self.eps_threshold = eps_threshold
+
+    def certified_radius(self, probs: torch.Tensor) -> torch.Tensor:
+        """
+        Compute per-sample certified radius ε_cert.
+
+        ε_cert(X,G) = (p[c*] - max_{c≠c*} p[c]) / 2
+
+        A sample is certified robust if ε_cert > eps_threshold.
+
+        Args:
+            probs: Softmax probabilities (B, C)
+
+        Returns:
+            eps_cert: Per-sample certified radius (B,)
+        """
+        # Top-2 probabilities
+        top2 = probs.topk(k=2, dim=-1).values       # (B, 2)
+        margin = top2[:, 0] - top2[:, 1]            # (B,)
+        eps_cert = margin / 2.0                     # (B,)
+        return eps_cert
+
+    def certified_robustness_rate(
+        self,
+        probs: torch.Tensor,
+        eps_threshold: float = None,
+    ) -> float:
+        """
+        Compute Certified Robustness Rate (CRR) over a batch.
+
+        CRR = |{i : ε_cert(X^i, G^i) > eps_threshold}| / N
+
+        Args:
+            probs: (B, C)
+            eps_threshold: Override default threshold.
+
+        Returns:
+            CRR as a float in [0, 1].
+        """
+        threshold = eps_threshold or self.eps_threshold
+        eps_cert = self.certified_radius(probs)
+        crr = (eps_cert > threshold).float().mean().item()
+        return crr
+
+    def lipschitz_penalty(self, model: nn.Module) -> torch.Tensor:
+        """
+        Compute soft Lipschitz penalty:
+        R_Lip = Σ_l max(0, σ(W_l) - 1)²
+
+        This quadratic penalty complements the hard spectral normalisation
+        (Eq. 22) for more stable CRR across training runs.
+
+        Args:
+            model: The full RADARNet model.
+
+        Returns:
+            R_Lip: Scalar penalty tensor.
+        """
+        penalty = torch.tensor(0.0)
+        for module in model.modules():
+            if hasattr(module, "_sigma"):
+                sigma = module._sigma
+                excess = F.relu(sigma - self.sigma_target)
+                penalty = penalty + excess.pow(2)
+        return penalty
+
+    def forward(self, probs: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass returns certified radii (for use in joint loss or eval).
+        """
+        return self.certified_radius(probs)
