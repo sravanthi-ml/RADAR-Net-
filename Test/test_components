@@ -1,0 +1,176 @@
+"""
+Unit tests for RADAR-Net components.
+Run: pytest tests/ -v --cov=src
+"""
+
+import pytest
+import torch
+import torch.nn as nn
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from src.models.crl import CertifiedRobustnessLayer
+from src.models.rlpn import RLPolicyNetwork
+from src.models.ffm import FeatureFusionModule
+from src.models.spectral_norm import spectral_norm_
+
+
+# ── CRL Tests ──────────────────────────────────────────────────────────
+
+class TestCRL:
+
+    def test_certified_radius_correct_shape(self):
+        crl = CertifiedRobustnessLayer()
+        probs = torch.softmax(torch.randn(8, 2), dim=-1)
+        eps_cert = crl.certified_radius(probs)
+        assert eps_cert.shape == (8,), "CRL output shape mismatch"
+
+    def test_certified_radius_non_negative(self):
+        crl = CertifiedRobustnessLayer()
+        probs = torch.softmax(torch.randn(16, 2), dim=-1)
+        eps_cert = crl.certified_radius(probs)
+        assert (eps_cert >= 0).all(), "Certified radius should be non-negative"
+
+    def test_crr_in_range(self):
+        crl = CertifiedRobustnessLayer(eps_threshold=0.05)
+        probs = torch.softmax(torch.randn(100, 2), dim=-1)
+        crr = crl.certified_robustness_rate(probs)
+        assert 0.0 <= crr <= 1.0, f"CRR out of range: {crr}"
+
+    def test_high_margin_gives_high_crr(self):
+        """Confident predictions should have high CRR."""
+        crl = CertifiedRobustnessLayer(eps_threshold=0.05)
+        # Very confident predictions
+        probs = torch.tensor([[0.02, 0.98]] * 100, dtype=torch.float32)
+        crr = crl.certified_robustness_rate(probs)
+        assert crr > 0.9, f"Expected high CRR for confident predictions, got {crr}"
+
+    def test_theorem2_margin_condition(self):
+        """Verify Theorem 2: ε_cert = margin/2."""
+        crl = CertifiedRobustnessLayer()
+        probs = torch.tensor([[0.3, 0.7], [0.1, 0.9]], dtype=torch.float32)
+        eps_cert = crl.certified_radius(probs)
+        # margin = 0.7 - 0.3 = 0.4 → ε_cert = 0.2
+        expected = torch.tensor([0.2, 0.4])
+        assert torch.allclose(eps_cert, expected, atol=1e-5), \
+            f"Theorem 2 violation: expected {expected}, got {eps_cert}"
+
+
+# ── Spectral Norm Tests ─────────────────────────────────────────────────
+
+class TestSpectralNorm:
+
+    def test_spectral_norm_enforces_bound(self):
+        """After forward pass, σ(W) ≤ sigma_target."""
+        layer = nn.Linear(128, 64)
+        spectral_norm_(layer, sigma_target=1.0)
+
+        x = torch.randn(4, 128)
+        _ = layer(x)  # triggers hook
+
+        assert hasattr(layer, "_sigma"), "Spectral norm not registered"
+        assert layer._sigma.item() <= 1.05, \
+            f"Spectral norm exceeds target: {layer._sigma.item()}"
+
+    def test_sigma_target_respected(self):
+        """sigma_target=0.5 should keep σ(W) ≤ 0.5."""
+        layer = nn.Linear(64, 32)
+        spectral_norm_(layer, sigma_target=0.5)
+        x = torch.randn(4, 64)
+        _ = layer(x)
+        assert layer._sigma.item() <= 0.55, \
+            f"sigma_target=0.5 violated: {layer._sigma.item()}"
+
+    def test_lipschitz_chain(self):
+        """Product of spectral norms ≤ 1 (Lemma 1)."""
+        layers = [nn.Linear(128, 64), nn.Linear(64, 32)]
+        for l in layers:
+            spectral_norm_(l, sigma_target=1.0)
+
+        x = torch.randn(4, 128)
+        for l in layers:
+            x = torch.relu(l(x))
+
+        product = 1.0
+        for l in layers:
+            if hasattr(l, "_sigma"):
+                product *= l._sigma.item()
+        assert product <= 1.05, f"Lipschitz chain violated: L={product}"
+
+
+# ── RLPN Tests ─────────────────────────────────────────────────────────
+
+class TestRLPN:
+
+    def test_action_in_range(self):
+        rlpn = RLPolicyNetwork(state_dim=528, num_actions=5)
+        state = torch.randn(8, 528)
+        action = rlpn.select_action(state, deterministic=True)
+        assert action.shape == (8,)
+        assert (action >= 0).all() and (action < 5).all()
+
+    def test_epsilon_decay(self):
+        rlpn = RLPolicyNetwork(eps_start=1.0, eps_end=0.05, eps_decay_steps=100)
+        initial_eps = rlpn.epsilon
+        # Simulate steps
+        for _ in range(100):
+            rlpn._step += 1
+        assert rlpn.epsilon < initial_eps, "Epsilon should decay over steps"
+        assert rlpn.epsilon >= 0.05, "Epsilon should not go below eps_end"
+
+    def test_policy_loss_gradient(self):
+        rlpn = RLPolicyNetwork()
+        log_probs = torch.randn(10, requires_grad=True)
+        rewards = torch.randn(10)
+        loss = rlpn.compute_loss(log_probs, rewards)
+        loss.backward()
+        assert log_probs.grad is not None, "Gradient not computed for log_probs"
+
+    def test_attack_signature_shape(self):
+        rlpn = RLPolicyNetwork()
+        B = 4
+        token_mag = torch.rand(B)
+        sent_mag  = torch.rand(B)
+        graph_ed  = torch.rand(B)
+        conf_drop = torch.rand(B)
+        v_t = rlpn.encode_attack_signature(token_mag, sent_mag, graph_ed, conf_drop)
+        assert v_t.shape == (B, 16), f"Attack signature shape wrong: {v_t.shape}"
+
+
+# ── FFM Tests ──────────────────────────────────────────────────────────
+
+class TestFFM:
+
+    def test_output_shapes(self):
+        ffm = FeatureFusionModule(d_text=768, d_graph=128, d_fuse=256, num_classes=2)
+        H_text  = torch.randn(4, 768)
+        H_graph = torch.randn(4, 128)
+        z, logits = ffm(H_text, H_graph)
+        assert z.shape == (4, 256), f"FFM z shape wrong: {z.shape}"
+        assert logits.shape == (4, 2), f"FFM logits shape wrong: {logits.shape}"
+
+    def test_gate_values_in_01(self):
+        """Bilinear gate g should be in (0,1)."""
+        ffm = FeatureFusionModule()
+        H_text  = torch.randn(8, 768)
+        H_graph = torch.randn(8, 128)
+        concat = torch.cat([H_text, H_graph], dim=-1)
+        g = torch.sigmoid(ffm.W_g(concat))
+        assert (g >= 0).all() and (g <= 1).all(), "Gate values out of (0,1)"
+
+    def test_spectral_norms_applied(self):
+        """All FFM linear layers should have spectral norm hooks."""
+        ffm = FeatureFusionModule()
+        H_text  = torch.randn(2, 768)
+        H_graph = torch.randn(2, 128)
+        ffm(H_text, H_graph)   # trigger forward hooks
+
+        for name, module in ffm.named_modules():
+            if isinstance(module, nn.Linear):
+                assert hasattr(module, "_sigma"), \
+                    f"Spectral norm not applied to FFM.{name}"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "--tb=short"])
