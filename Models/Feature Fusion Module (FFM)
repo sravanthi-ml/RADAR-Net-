@@ -1,0 +1,93 @@
+"""
+Feature Fusion Module (FFM)
+Bilinear gating mechanism combining text and graph representations.
+Adapts modal weights to propagation graph density.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .spectral_norm import spectral_norm_
+
+
+class FeatureFusionModule(nn.Module):
+    """
+    FFM: Bilinear gating fusion for text + graph representations.
+
+    z = g ⊙ (W_t H_text) + (1-g) ⊙ (W_h H_graph)
+    where g = σ(W_g [H_text; H_graph] + b_g)
+
+    All weight matrices spectrally normalised (CRL Lemma 1).
+
+    Args:
+        d_text (int): Text embedding dim. Default: 768.
+        d_graph (int): Graph embedding dim. Default: 128.
+        d_fuse (int): Fusion dim. Default: 256.
+        num_classes (int): Output classes. Default: 2.
+        sigma_target (float): Spectral norm target. Default: 1.0.
+        dropout (float): Dropout. Default: 0.1.
+    """
+
+    def __init__(
+        self,
+        d_text: int = 768,
+        d_graph: int = 128,
+        d_fuse: int = 256,
+        num_classes: int = 2,
+        sigma_target: float = 1.0,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        # Gate: W_g ∈ ℝ^{d_fuse × (d_text+d_graph)}
+        self.W_g = nn.Linear(d_text + d_graph, d_fuse)
+        # Text projection: W_t ∈ ℝ^{d_fuse × d_text}
+        self.W_t = nn.Linear(d_text, d_fuse, bias=False)
+        # Graph projection: W_h ∈ ℝ^{d_fuse × d_graph}
+        self.W_h = nn.Linear(d_graph, d_fuse, bias=False)
+
+        # Residual MLP: z' = z + W2(σ(W1 z + b1)) + b2
+        self.W1 = nn.Linear(d_fuse, d_fuse)
+        self.W2 = nn.Linear(d_fuse, d_fuse)
+
+        # Classifier: W_c ∈ ℝ^{num_classes × d_fuse}
+        self.W_c = nn.Linear(d_fuse, num_classes)
+
+        self.dropout = nn.Dropout(dropout)
+        self.act = nn.ReLU()
+
+        # Spectral normalisation on ALL weight matrices (Θ = {W_g,W_t,W_h,W1,W2,W_c})
+        for linear in [self.W_g, self.W_t, self.W_h, self.W1, self.W2, self.W_c]:
+            spectral_norm_(linear, sigma_target=sigma_target)
+
+    def forward(
+        self,
+        H_text: torch.Tensor,
+        H_graph: torch.Tensor,
+    ):
+        """
+        Args:
+            H_text: (B, d_text)
+            H_graph: (B, d_graph)
+
+        Returns:
+            z: Fused representation (B, d_fuse)
+            logits: Classification logits (B, num_classes)
+        """
+        # Gate computation: g = σ(W_g [H_text; H_graph])
+        concat = torch.cat([H_text, H_graph], dim=-1)     # (B, d_text+d_graph)
+        g = torch.sigmoid(self.W_g(concat))               # (B, d_fuse)
+
+        # Bilinear gating: z = g ⊙ W_t H_text + (1-g) ⊙ W_h H_graph
+        z_text  = self.W_t(H_text)                        # (B, d_fuse)
+        z_graph = self.W_h(H_graph)                       # (B, d_fuse)
+        z = g * z_text + (1.0 - g) * z_graph             # (B, d_fuse)
+
+        # Residual MLP
+        z_prime = z + self.W2(self.act(self.W1(z)))       # (B, d_fuse)
+        z_prime = self.dropout(z_prime)
+
+        # Classification
+        logits = self.W_c(z_prime)                        # (B, num_classes)
+
+        return z_prime, logits
