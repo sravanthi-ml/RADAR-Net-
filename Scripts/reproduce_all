@@ -1,0 +1,52 @@
+#!/bin/bash
+# Reproduce all RADAR-Net paper results
+# Requires: all 4 datasets downloaded and preprocessed
+# Hardware: NVIDIA A100 80GB (or equivalent)
+
+set -e
+
+echo "============================================================"
+echo "RADAR-Net — Reproducing Paper Results"
+echo "============================================================"
+
+DEVICE=${1:-"cuda:0"}
+OUTPUT_DIR="checkpoints"
+RESULTS_DIR="results"
+
+mkdir -p $OUTPUT_DIR $RESULTS_DIR/tables
+
+# ── Train on all datasets ─────────────────────────────────────
+for DATASET in pheme twitter15 twitter16 weibo; do
+    echo ""
+    echo "Training on $DATASET..."
+    python scripts/train.py \
+        --dataset $DATASET \
+        --phase all \
+        --device $DEVICE \
+        --output_dir $OUTPUT_DIR/$DATASET \
+        --seed 42
+done
+
+# ── Evaluate on all datasets ─────────────────────────────────
+for DATASET in pheme twitter15 twitter16 weibo; do
+    echo ""
+    echo "Evaluating on $DATASET..."
+    python scripts/evaluate.py \
+        --dataset $DATASET \
+        --checkpoint $OUTPUT_DIR/$DATASET/final.pt \
+        --attacks all \
+        --crr \
+        --eps_threshold 0.05 \
+        --device $DEVICE \
+        --output $RESULTS_DIR/$DATASET/results.json
+done
+
+# ── Display results ───────────────────────────────────────────
+echo ""
+echo "============================================================"
+echo "Paper Results"
+echo "============================================================"
+python scripts/reproduce.py --table all
+
+echo ""
+echo "Done. Full results saved to $RESULTS_DIR/"
