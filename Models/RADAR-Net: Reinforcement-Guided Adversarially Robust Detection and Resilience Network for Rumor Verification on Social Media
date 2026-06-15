@@ -1,0 +1,203 @@
+"""
+RADAR-Net: Reinforcement-Guided Adversarially Robust Detection and
+Resilience Network for Rumor Verification on Social Media.
+
+Main model class integrating CTE, LPE, FFM, HATM, RLPN, and CRL.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple, Dict
+
+from .cte import CompactTransformerEncoder
+from .lpe import LightweightPropagationEncoder
+from .ffm import FeatureFusionModule
+from .rlpn import RLPolicyNetwork
+from .crl import CertifiedRobustnessLayer
+
+
+class RADARNet(nn.Module):
+    """
+    RADAR-Net: unified dual-modal adversarially robust rumor detector.
+
+    Architecture:
+        CTE (text) ──┐
+                     ├──► FFM ──► [HATM | RLPN | CRL] ──► ŷ + ε_cert
+        LPE (graph) ─┘
+
+    Args:
+        d_model (int): CTE hidden dimension. Default: 768.
+        d_graph (int): LPE output dimension. Default: 128.
+        d_fuse (int): FFM fusion dimension. Default: 256.
+        num_classes (int): Number of output classes. Default: 2.
+        sigma_target (float): Spectral norm target for CRL. Default: 1.0.
+        num_actions (int): Number of RLPN defense actions. Default: 5.
+        dropout (float): Dropout rate. Default: 0.1.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 768,
+        d_graph: int = 128,
+        d_fuse: int = 256,
+        num_classes: int = 2,
+        sigma_target: float = 1.0,
+        num_actions: int = 5,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        self.d_model = d_model
+        self.d_graph = d_graph
+        self.d_fuse = d_fuse
+        self.sigma_target = sigma_target
+
+        # ── Encoders ──────────────────────────────────────────────────────
+        self.cte = CompactTransformerEncoder(
+            d_model=d_model,
+            dropout=dropout,
+            sigma_target=sigma_target,
+        )
+
+        self.lpe = LightweightPropagationEncoder(
+            in_dim=d_model,    # DistilBERT node features
+            hidden_dim=256,
+            out_dim=d_graph,
+            sigma_target=sigma_target,
+        )
+
+        # ── Fusion ────────────────────────────────────────────────────────
+        self.ffm = FeatureFusionModule(
+            d_text=d_model,
+            d_graph=d_graph,
+            d_fuse=d_fuse,
+            num_classes=num_classes,
+            sigma_target=sigma_target,
+            dropout=dropout,
+        )
+
+        # ── Defense modules ───────────────────────────────────────────────
+        self.rlpn = RLPolicyNetwork(
+            state_dim=d_fuse + 16,   # FFM output + attack signature
+            hidden_dim=128,
+            num_actions=num_actions,
+        )
+
+        self.crl = CertifiedRobustnessLayer(sigma_target=sigma_target)
+
+    def encode(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        node_features: torch.Tensor,
+        adj: torch.Tensor,
+        batch_idx: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Encode text and graph, fuse representations.
+
+        Returns:
+            z: Fused representation (B, d_fuse)
+            logits: Classification logits (B, num_classes)
+            h_text: Text embeddings for HATM perturbation (B, d_model)
+        """
+        h_text = self.cte(input_ids, attention_mask)          # (B, d_model)
+        h_graph = self.lpe(node_features, adj, batch_idx)     # (B, d_graph)
+        z, logits = self.ffm(h_text, h_graph)                 # (B, d_fuse), (B, C)
+        return z, logits, h_text
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        node_features: torch.Tensor,
+        adj: torch.Tensor,
+        batch_idx: Optional[torch.Tensor] = None,
+        attack_signature: Optional[torch.Tensor] = None,
+        training: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Full forward pass with optional RLPN defense selection.
+
+        Args:
+            input_ids: Token IDs (B, T)
+            attention_mask: Attention mask (B, T)
+            node_features: Graph node features (N, d_model)
+            adj: Normalised adjacency matrix
+            batch_idx: Node-to-graph assignment (N,)
+            attack_signature: Attack signature vector (B, 16), optional.
+                              If None, no RLPN action is applied.
+            training: If True, returns raw logits for loss computation.
+
+        Returns:
+            dict with keys:
+                logits (B, C), probs (B, C), pred (B,),
+                z (B, d_fuse), action (B,) or None,
+                eps_cert (B,)
+        """
+        z, logits, h_text = self.encode(
+            input_ids, attention_mask, node_features, adj, batch_idx
+        )
+
+        # ── RLPN adaptive defense (inference only) ────────────────────────
+        action = None
+        if attack_signature is not None and not training:
+            state = torch.cat([z, attack_signature], dim=-1)  # (B, d_fuse+16)
+            action = self.rlpn.select_action(state)            # (B,)
+            # Defense actions modulate logits or recompute representations
+            logits = self._apply_defense(
+                action, input_ids, attention_mask,
+                node_features, adj, batch_idx, logits
+            )
+
+        # ── CRL: compute per-sample certified radius ───────────────────────
+        probs = F.softmax(logits, dim=-1)                     # (B, C)
+        eps_cert = self.crl.certified_radius(probs)           # (B,)
+
+        return {
+            "logits": logits,
+            "probs": probs,
+            "pred": probs.argmax(dim=-1),
+            "z": z,
+            "action": action,
+            "eps_cert": eps_cert,
+            "h_text": h_text,
+        }
+
+    def _apply_defense(
+        self,
+        action: torch.Tensor,
+        input_ids, attention_mask,
+        node_features, adj, batch_idx,
+        logits_clean: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply the RLPN-selected defense action.
+
+        Actions:
+            a0: augmentation only (K=3 perturbed copies average)
+            a1: denoising + augmentation
+            a2: ensemble voting (3 random seeds)
+            a3: certified smoothing (M=100 forward passes)
+            a4: graph structure regularization
+        """
+        # For clarity actions are applied per-sample; in practice batched.
+        # This stub returns clean logits — full implementation in defense/actions.py
+        return logits_clean
+
+    def get_lipschitz_penalty(self) -> torch.Tensor:
+        """
+        Compute R_Lip = Σ_l max(0, σ(W_l) - 1)²
+        Soft enforcement complementing hard spectral normalisation.
+        """
+        penalty = torch.tensor(0.0, device=next(self.parameters()).device)
+        for module in self.modules():
+            if hasattr(module, "weight") and module.weight is not None:
+                if hasattr(module, "_sigma"):
+                    sigma = module._sigma
+                    penalty = penalty + F.relu(sigma - 1.0).pow(2)
+        return penalty
+
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
