@@ -1,0 +1,139 @@
+# Datasets
+
+RADAR-Net is evaluated on four benchmark datasets for rumor detection,
+covering two languages, two platforms, and six-fold variation in propagation density.
+
+---
+
+## Dataset Summary
+
+| Dataset | Language | Posts | Rumors | Non-Rumors | Platform | Avg Replies | Split (Train/Val/Test) |
+|---------|----------|-------|--------|------------|----------|-------------|------------------------|
+| PHEME   | English  | 6,425 | 3,103  | 3,322      | Twitter  | 14.2        | 4,498 / 643 / 1,284    |
+| Twitter15 | English | 1,490 | 374   | 578        | Twitter  | 223.4       | 1,043 / 149 / 298      |
+| Twitter16 | English | 818  | 205   | 373        | Twitter  | 251.7       | 573 / 82 / 163         |
+| Weibo   | Chinese  | 4,664 | 2,313  | 2,351      | Weibo    | 35.6        | 3,264 / 467 / 933      |
+
+Splits are stratified (balanced class distribution in each set).
+Propagation graphs truncated at D_max=5 depth and F_max=20 fan-out.
+Posts with fewer than 3 replies receive zero-padded virtual silent nodes.
+
+---
+
+## Download Instructions
+
+### PHEME
+
+```bash
+# Request access at: https://figshare.com/articles/dataset/PHEME_dataset_for_Rumour_Detection_and_Veracity_Classification/6392078
+# Download and extract:
+mkdir -p data/raw/pheme
+# Place downloaded files in data/raw/pheme/
+python data/scripts/preprocess_pheme.py
+```
+
+**License:** Creative Commons Attribution 4.0 International
+
+### Twitter15 / Twitter16
+
+```bash
+# Download from original BiGCN repository:
+# https://github.com/TianBian95/BiGCN
+mkdir -p data/raw/twitter15 data/raw/twitter16
+# Follow instructions in the BiGCN repository README
+python data/scripts/preprocess_twitter.py --dataset twitter15
+python data/scripts/preprocess_twitter.py --dataset twitter16
+```
+
+**License:** See BiGCN repository
+
+### Weibo
+
+```bash
+# Available via Ma et al. (2016):
+# https://alt.qcri.org/~wgao/data/rumdect.zip
+mkdir -p data/raw/weibo
+# Place downloaded files in data/raw/weibo/
+python data/scripts/preprocess_weibo.py
+```
+
+**License:** Research use only
+
+---
+
+## One-Command Download (automated)
+
+```bash
+bash scripts/download_datasets.sh
+```
+
+This script will download all publicly available datasets and run preprocessing.
+Datasets that require manual registration (PHEME) will prompt you with instructions.
+
+---
+
+## Preprocessing
+
+After downloading, run preprocessing to build propagation graphs and tokenize text:
+
+```bash
+# Preprocess all datasets
+python data/scripts/preprocess.py --dataset all
+
+# Preprocess specific dataset
+python data/scripts/preprocess.py --dataset pheme
+python data/scripts/preprocess.py --dataset twitter15
+python data/scripts/preprocess.py --dataset twitter16
+python data/scripts/preprocess.py --dataset weibo
+```
+
+Processed data will be saved to `data/processed/` in the following format:
+
+```
+data/processed/
+├── pheme/
+│   ├── train.pt    # torch geometric Data objects
+│   ├── val.pt
+│   └── test.pt
+├── twitter15/
+│   ├── train.pt
+│   ├── val.pt
+│   └── test.pt
+├── twitter16/
+│   └── ...
+└── weibo/
+    └── ...
+```
+
+---
+
+## Data Format
+
+Each sample is stored as:
+
+```python
+{
+    "input_ids":      torch.LongTensor,    # (T,) — max T=512 tokens
+    "attention_mask": torch.LongTensor,    # (T,)
+    "node_features":  torch.FloatTensor,   # (N, 768) — DistilBERT embeddings
+    "adj":            torch.FloatTensor,   # (N, N) — normalised adjacency
+    "batch_idx":      torch.LongTensor,    # (N,) — node-to-graph mapping
+    "label":          int,                 # 0=non-rumour, 1=rumour
+    "post_id":        str,
+}
+```
+
+---
+
+## Citation
+
+If you use these datasets, please cite the original papers:
+
+**PHEME:**
+> Zubiaga, A., et al. (2016). Analysing how people orient to and spread rumours in social media. PLoS ONE.
+
+**Twitter15/16:**
+> Ma, J., et al. (2017). Detect rumors in microblog posts using propagation structure via kernel learning. ACL 2017.
+
+**Weibo:**
+> Ma, J., et al. (2016). Detecting rumors from microblogs with recurrent neural networks. IJCAI 2016.
