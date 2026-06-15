@@ -1,0 +1,63 @@
+"""
+Spectral normalisation via one-step power iteration.
+Applied at every forward pass to all linear layers in RADAR-Net.
+
+Enforces σ(W_l) ≤ sigma_target (Lipschitz chain for CRL Lemma 1).
+û and v̂ are persistent across forward passes — each step refines
+the previous estimate. One step per pass is sufficient because
+weights change slowly during training.
+"""
+
+import torch
+import torch.nn as nn
+
+
+def spectral_norm_(module: nn.Linear, sigma_target: float = 1.0, name: str = "weight"):
+    """
+    Register spectral normalisation hook on a nn.Linear module (in-place).
+
+    On every forward pass:
+        1. One step of power iteration to estimate σ(W)
+        2. Hard normalisation: W_sn = W / max(1, σ̂(W) / sigma_target)
+
+    Args:
+        module: Linear layer to normalise.
+        sigma_target: Upper bound on spectral norm. Default: 1.0.
+        name: Weight attribute name. Default: "weight".
+    """
+    weight = getattr(module, name)
+    h, w = weight.shape if weight.dim() == 2 else (weight.shape[0], -1)
+
+    # Initialise singular vector estimates
+    u = nn.functional.normalize(weight.new_empty(h).normal_(0, 1), dim=0)
+    v = nn.functional.normalize(weight.new_empty(w).normal_(0, 1), dim=0)
+
+    module.register_buffer("_u", u.detach())
+    module.register_buffer("_v", v.detach())
+    module._sigma_target = sigma_target
+
+    def _sn_hook(mod, inputs, output):
+        W = getattr(mod, name)
+        W_mat = W.reshape(W.shape[0], -1)
+
+        with torch.no_grad():
+            # Step 1: v̂ = W^T û / ‖W^T û‖₂
+            v_new = nn.functional.normalize(W_mat.t() @ mod._u, dim=0)
+            # Step 2: û = W v̂ / ‖W v̂‖₂
+            u_new = nn.functional.normalize(W_mat @ v_new, dim=0)
+            mod._v.copy_(v_new)
+            mod._u.copy_(u_new)
+
+        # Step 3: σ̂(W) = û^T W v̂
+        sigma = (mod._u @ W_mat @ mod._v).abs()
+        mod._sigma = sigma
+
+        # Hard normalisation: W_sn = W / max(1, σ̂/σ_target)
+        if sigma > mod._sigma_target:
+            scale = mod._sigma_target / sigma
+            # Apply in-place during forward (non-gradient operation)
+            with torch.no_grad():
+                W.data.mul_(scale)
+
+    module.register_forward_hook(_sn_hook)
+    return module
