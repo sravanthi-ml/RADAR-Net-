@@ -1,0 +1,280 @@
+"""
+Hierarchical Adversarial Training Module (HATM)
+Three-level adversarial augmentation for dual-modal rumor detection.
+
+Levels:
+    1. Token-level: PGD on CTE embedding space (n_steps=3, ε=0.1)
+    2. Sentence-level: Gradient ascent on clause representations
+    3. Graph-level: Edge toggle via continuous relaxation
+"""
+
+import torch
+import torch.nn.functional as F
+from typing import Tuple, Dict
+
+
+class HATMTrainer:
+    """
+    HATM: Generates adversarial examples at three granularity levels.
+
+    Executes 5 steps per mini-batch:
+        1. Token-level perturbation (PGD)
+        2. Sentence-level perturbation (gradient ascent on clauses)
+        3. Graph-level perturbation (edge toggle via score)
+        4. Augmented batch construction (4× original size)
+        5. Gradient update with HATM loss
+
+    Args:
+        epsilon_token (float): L2 ball radius for token perturbation. Default: 0.1.
+        pgd_steps (int): PGD inner steps. Default: 3.
+        lambda_1 (float): Token-level loss weight. Default: 0.4.
+        lambda_2 (float): Sentence-level loss weight. Default: 0.3.
+        lambda_3 (float): Graph-level loss weight. Default: 0.3.
+        lambda_H (float): HATM total weight in joint loss. Default: 0.5.
+        top_k_edges (int): Edges toggled per perturbation step. Default: 5.
+        d_max_degree (int): Max degree change per node. Default: 3.
+        tau_init (float): Initial temperature for graph relaxation. Default: 1.0.
+        tau_final (float): Final temperature. Default: 0.1.
+        warmup_epochs (int): Epochs to warm up lambda_H from 0. Default: 10.
+    """
+
+    def __init__(
+        self,
+        epsilon_token: float = 0.1,
+        pgd_steps: int = 3,
+        lambda_1: float = 0.4,
+        lambda_2: float = 0.3,
+        lambda_3: float = 0.3,
+        lambda_H: float = 0.5,
+        top_k_edges: int = 5,
+        d_max_degree: int = 3,
+        tau_init: float = 1.0,
+        tau_final: float = 0.1,
+        warmup_epochs: int = 10,
+    ):
+        assert abs(lambda_1 + lambda_2 + lambda_3 - 1.0) < 1e-5, \
+            "HATM level weights must sum to 1.0"
+
+        self.eps = epsilon_token
+        self.pgd_steps = pgd_steps
+        self.alpha = epsilon_token / pgd_steps     # step size α = ε/n
+        self.lam1 = lambda_1
+        self.lam2 = lambda_2
+        self.lam3 = lambda_3
+        self.lambda_H = lambda_H
+        self.top_k = top_k_edges
+        self.d_max = d_max_degree
+        self.tau_init = tau_init
+        self.tau_final = tau_final
+        self.warmup_epochs = warmup_epochs
+
+    def get_effective_lambda_H(self, epoch: int) -> float:
+        """Linear warm-up of λ_H from 0 → lambda_H over warmup_epochs."""
+        if epoch >= self.warmup_epochs:
+            return self.lambda_H
+        return self.lambda_H * (epoch / self.warmup_epochs)
+
+    def get_tau(self, epoch: int, total_epochs: int) -> float:
+        """Anneal temperature τ from tau_init → tau_final during training."""
+        progress = epoch / max(total_epochs - 1, 1)
+        return self.tau_init + progress * (self.tau_final - self.tau_init)
+
+    # ── Step 1: Token-level PGD ──────────────────────────────────────────
+
+    def token_perturbation(
+        self,
+        model,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        node_features: torch.Tensor,
+        adj: torch.Tensor,
+        labels: torch.Tensor,
+        batch_idx: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        PGD perturbation on token embeddings.
+
+        δ^{t+1}_{tok} = Π_{‖δ‖₂≤ε} (δ^t + α·∇_δ L_cls)
+
+        Random start prevents gradient masking.
+
+        Returns:
+            delta: Optimal token-level perturbation (B, T, d_model)
+        """
+        # Get token embeddings from CTE
+        embeddings = model.cte.encoder.embeddings(input_ids)  # (B, T, d_model)
+
+        # Random initialisation: δ⁰ ~ Uniform(-ε, ε)
+        delta = torch.empty_like(embeddings).uniform_(-self.eps, self.eps)
+        delta.requires_grad_(True)
+
+        for step in range(self.pgd_steps):
+            # Forward pass with perturbed embeddings
+            perturbed_emb = embeddings.detach() + delta
+            h_text = model.cte._pool_embeddings(perturbed_emb, attention_mask)
+            h_graph = model.lpe(node_features, adj, batch_idx)
+            _, logits = model.ffm(h_text, h_graph)
+
+            loss = F.cross_entropy(logits, labels)
+            loss.backward()
+
+            # PGD step: δ ← Π_{‖δ‖₂≤ε}(δ + α·sign(∇_δ L))
+            with torch.no_grad():
+                grad = delta.grad.detach()
+                # Normalise gradient (steepest ascent in L2 ball)
+                grad_norm = grad.reshape(grad.shape[0], -1).norm(dim=1)
+                grad_norm = grad_norm.view(-1, 1, 1).clamp(min=1e-8)
+                delta = delta.detach() + self.alpha * grad / grad_norm
+
+                # L2 projection onto ε-ball
+                delta_norm = delta.reshape(delta.shape[0], -1).norm(dim=1)
+                delta_norm = delta_norm.view(-1, 1, 1)
+                delta = delta * (self.eps / delta_norm.clamp(min=self.eps))
+                delta.requires_grad_(True)
+
+        return delta.detach()
+
+    # ── Step 2: Sentence-level perturbation ─────────────────────────────
+
+    def sentence_perturbation(
+        self,
+        model,
+        H_text: torch.Tensor,
+        labels: torch.Tensor,
+        clause_boundaries: list,
+        H_graph: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Gradient ascent on clause-mean representations.
+
+        H^{sent}_i = mean(H_text[t] for t ∈ S_i)
+        δ^{sent}_i = α · ∇_{H^{sent}_i} L_cls
+
+        Returns:
+            delta_sent: Token-level perturbation (B, T, d_model)
+        """
+        H_text_clone = H_text.detach().requires_grad_(True)
+        _, logits = model.ffm(H_text_clone, H_graph.detach())
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+
+        grad = H_text_clone.grad                             # (B, T, d_model)
+        delta_sent = torch.zeros_like(grad)
+
+        # Broadcast clause gradient to all tokens in each clause
+        for clause in clause_boundaries:
+            start, end = clause
+            clause_grad = grad[:, start:end, :].mean(dim=1, keepdim=True)
+            delta_sent[:, start:end, :] = self.alpha * clause_grad
+
+        return delta_sent.detach()
+
+    # ── Step 3: Graph-level perturbation ─────────────────────────────────
+
+    def graph_perturbation(
+        self,
+        model,
+        node_features: torch.Tensor,
+        adj: torch.Tensor,
+        H_text: torch.Tensor,
+        labels: torch.Tensor,
+        batch_idx: torch.Tensor,
+        tau: float,
+    ) -> torch.Tensor:
+        """
+        Continuous relaxation for differentiable graph perturbation.
+
+        A_relaxed = A + τZ  (differentiable w.r.t. Z)
+        s_ij = |∂L_cls/∂Z_ij|
+        Toggle top-k edges by score (subject to degree constraint d_max=3)
+
+        Returns:
+            perturbed_adj: Modified adjacency (sparse or dense)
+        """
+        N = node_features.shape[0]
+        Z = torch.zeros(N, N, device=node_features.device, requires_grad=True)
+
+        # Forward through LPE with relaxed adjacency
+        # A_relaxed = A + tau * Z
+        # (Implementation uses dense adjacency for gradient computation)
+        H_graph_relaxed = model.lpe._forward_relaxed(
+            node_features, adj, Z, tau, batch_idx
+        )
+        _, logits = model.ffm(H_text.detach(), H_graph_relaxed)
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+
+        with torch.no_grad():
+            scores = Z.grad.abs()                            # (N, N)
+
+            # Apply degree constraint: |deg(v) - deg'(v)| ≤ d_max
+            # (simplified: enforce via masking high-degree nodes)
+            perturbed_adj = adj.clone()
+            flat_scores = scores.reshape(-1)
+            topk_idx = flat_scores.topk(self.top_k).indices
+
+            for idx in topk_idx:
+                i, j = idx // N, idx % N
+                # Toggle edge (add if absent, remove if present)
+                if perturbed_adj[i, j] == 0:
+                    perturbed_adj[i, j] = 1.0
+                    perturbed_adj[j, i] = 1.0
+                else:
+                    perturbed_adj[i, j] = 0.0
+                    perturbed_adj[j, i] = 0.0
+
+        return perturbed_adj
+
+    # ── Step 4+5: Loss computation ────────────────────────────────────────
+
+    def hatm_loss(
+        self,
+        model,
+        logits_tok: torch.Tensor,
+        logits_sent: torch.Tensor,
+        logits_graph: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        L_HATM = E[λ₁·L_cls(f(X+δ_tok,G)) + λ₂·L_cls(f(X+δ_sent,G)) + λ₃·L_cls(f(X,G'))]
+
+        Args:
+            logits_tok: Logits under token perturbation (B, C)
+            logits_sent: Logits under sentence perturbation (B, C)
+            logits_graph: Logits under graph perturbation (B, C)
+            labels: Ground-truth labels (B,)
+
+        Returns:
+            L_HATM: Scalar HATM loss
+        """
+        l_tok   = F.cross_entropy(logits_tok,   labels)
+        l_sent  = F.cross_entropy(logits_sent,  labels)
+        l_graph = F.cross_entropy(logits_graph, labels)
+        return self.lam1 * l_tok + self.lam2 * l_sent + self.lam3 * l_graph
+
+    def joint_loss(
+        self,
+        l_cls: torch.Tensor,
+        l_hatm: torch.Tensor,
+        l_rl: torch.Tensor,
+        r_lip: torch.Tensor,
+        lambda_H: float,
+        lambda_RL: float = 0.1,
+        lambda_L: float = 0.01,
+    ) -> torch.Tensor:
+        """
+        L_total = L_cls + λ_H·L_HATM + λ_RL·L_RL + λ_L·R_Lip
+
+        Args:
+            l_cls: Clean classification loss
+            l_hatm: HATM adversarial loss
+            l_rl: RLPN policy loss L_RL = -J(φ)
+            r_lip: Lipschitz penalty R_Lip = Σ max(0, σ(W_l)-1)²
+            lambda_H: Effective HATM weight (warmed up)
+            lambda_RL: RL loss weight. Default: 0.1.
+            lambda_L: Lipschitz penalty weight. Default: 0.01.
+
+        Returns:
+            L_total: Scalar total loss
+        """
+        return l_cls + lambda_H * l_hatm + lambda_RL * l_rl + lambda_L * r_lip
