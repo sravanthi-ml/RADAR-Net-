@@ -1,0 +1,44 @@
+# RADAR-Net dependencies
+# Tested on Python 3.9, CUDA 11.8, Ubuntu 20.04
+
+# Core
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Graph neural networks
+torch-geometric>=2.3.0
+torch-scatter>=2.1.0
+torch-sparse>=0.6.17
+torch-cluster>=1.6.0
+
+# Transformers (DistilBERT)
+transformers>=4.30.0
+tokenizers>=0.13.0
+datasets>=2.12.0
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-learn>=1.2.0
+pandas>=2.0.0
+
+# Adversarial attacks
+textattack>=0.3.8          # TextFooler, BERT-Attack
+
+# Config & utilities
+pyyaml>=6.0
+tqdm>=4.65.0
+wandb>=0.15.0              # optional: experiment tracking
+tensorboard>=2.13.0
+
+# Visualisation (for reproducing paper figures)
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Testing
+pytest>=7.3.0
+pytest-cov>=4.1.0
+
+# Type checking (optional)
+mypy>=1.3.0
