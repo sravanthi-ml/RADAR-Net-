@@ -1,0 +1,77 @@
+model:
+  d_model: 768
+  d_graph: 128
+  d_fuse: 256
+  num_classes: 2
+  sigma_target: 1.0           # CRL spectral norm target (deployment knob)
+  dropout: 0.1
+  pretrained: "distilbert-base-uncased"
+
+hatm:
+  epsilon_token: 0.1          # L2 ball radius for token perturbation
+  pgd_steps: 3                # PGD inner steps (training)
+  pgd_steps_eval: 20          # PGD inner steps (evaluation)
+  alpha: 0.033                # Step size = epsilon / pgd_steps
+  lambda_1: 0.4               # Token-level loss weight
+  lambda_2: 0.3               # Sentence-level loss weight
+  lambda_3: 0.3               # Graph-level loss weight
+  lambda_H: 0.5               # Total HATM weight in L_total
+  top_k_edges: 5              # Edges toggled per graph perturbation
+  d_max_degree: 3             # Max degree change per node (structural constraint)
+  tau_init: 1.0               # Initial graph relaxation temperature
+  tau_final: 0.1              # Final graph relaxation temperature
+
+rlpn:
+  lr: 5.0e-4
+  gamma: 0.95                 # Discount factor
+  eps_start: 1.0              # Initial epsilon for ε-greedy exploration
+  eps_end: 0.05               # Final epsilon
+  eps_decay_epochs: 10        # Epochs over which epsilon decays
+  buffer_capacity: 10000      # Replay buffer size
+  mini_batch_size: 256        # Trajectories per REINFORCE update
+  baseline_decay: 0.99        # EMA baseline decay: b_{t+1} = 0.99*b_t + 0.01*R_t
+  num_actions: 5
+
+crl:
+  eps_threshold: 0.05         # CRR certification threshold
+
+graph:
+  d_max_depth: 5              # Max propagation tree depth
+  f_max_fanout: 20            # Max fan-out per node
+  min_replies: 3              # Posts with fewer replies get virtual silent nodes
+  node_proj_dim: 256          # Node feature projection dimension
+
+training:
+  phase1_epochs: 50
+  phase2_epochs: 20
+  phase3_epochs: 10
+  batch_size: 32
+  lr_transformer: 2.0e-5
+  lr_gcn: 1.0e-3
+  lr_joint_backbone: 5.0e-6
+  lr_joint_rlpn: 1.0e-4
+  weight_decay: 1.0e-2
+  grad_clip: 1.0
+  early_stop_patience: 5
+  hatm_warmup_epochs: 10
+  lambda_RL: 0.1
+  lambda_L: 0.01
+  seed: 42
+
+data:
+  max_seq_len: 512
+  max_graph_nodes: 100
+  train_ratio: 0.70
+  val_ratio: 0.10
+  test_ratio: 0.20
+
+eval:
+  attack_epsilon: 0.1
+  attack_steps: 20            # PGD steps for evaluation attacks
+  attack_alpha: 0.01
+  textfooler_max_word_change: 0.15
+  textfooler_sim_threshold: 0.8
+  bert_attack_top_k: 6
+  gafsi_k_edges: 5
+  smoothing_sigma: 0.25
+  smoothing_m: 100            # Forward passes for certified smoothing (action a4)
