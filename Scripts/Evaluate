@@ -1,0 +1,188 @@
+"""
+RADAR-Net evaluation script.
+Evaluates clean accuracy, adversarial accuracy under 5 attacks, and CRR.
+"""
+
+import os
+import argparse
+import torch
+import json
+from typing import Dict
+
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from src.models.radar_net import RADARNet
+from src.utils.data_loader import get_dataloader
+from src.utils.metrics import compute_metrics
+from src.attacks.pgd import PGDAttack
+from src.attacks.fgsm import FGSMAttack
+from src.attacks.textfooler import TextFoolerAttack
+from src.attacks.bert_attack import BERTAttack
+from src.attacks.graph_attack import GraphAttack
+
+
+ATTACK_REGISTRY = {
+    "fgsm":       FGSMAttack,
+    "pgd":        PGDAttack,
+    "textfooler": TextFoolerAttack,
+    "bert_attack":BERTAttack,
+    "graph_attack":GraphAttack,
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate RADAR-Net")
+    parser.add_argument("--dataset", type=str, required=True,
+                        choices=["pheme", "twitter15", "twitter16", "weibo"])
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--attacks", type=str, default="all",
+                        help="Comma-separated attacks or 'all'")
+    parser.add_argument("--crr", action="store_true",
+                        help="Compute certified robustness rate")
+    parser.add_argument("--eps_threshold", type=float, default=0.05,
+                        help="CRR epsilon threshold")
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--output", type=str, default="results/eval_results.json")
+    return parser.parse_args()
+
+
+def evaluate_clean(model, loader, device) -> Dict:
+    """Evaluate clean accuracy and Macro-F1."""
+    model.eval()
+    all_preds, all_labels = [], []
+    total_eps_cert = []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            out = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                node_features=batch["node_features"],
+                adj=batch["adj"],
+                training=False,
+            )
+            all_preds.extend(out["pred"].cpu().tolist())
+            all_labels.extend(batch["labels"].cpu().tolist())
+            total_eps_cert.extend(out["eps_cert"].cpu().tolist())
+
+    metrics = compute_metrics(all_preds, all_labels)
+    metrics["mean_eps_cert"] = sum(total_eps_cert) / len(total_eps_cert)
+    return metrics
+
+
+def evaluate_adversarial(model, loader, attack, device) -> Dict:
+    """Evaluate adversarial accuracy under a given attack."""
+    model.eval()
+    all_preds, all_labels = [], []
+
+    for batch in loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+
+        # Generate adversarial examples
+        adv_batch = attack.perturb(model, batch)
+
+        with torch.no_grad():
+            out = model(
+                input_ids=adv_batch["input_ids"],
+                attention_mask=adv_batch["attention_mask"],
+                node_features=adv_batch["node_features"],
+                adj=adv_batch["adj"],
+                training=False,
+            )
+        all_preds.extend(out["pred"].cpu().tolist())
+        all_labels.extend(batch["labels"].cpu().tolist())
+
+    return compute_metrics(all_preds, all_labels)
+
+
+def evaluate_crr(model, loader, eps_threshold, device) -> float:
+    """Compute Certified Robustness Rate."""
+    model.eval()
+    certified_count = 0
+    total = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            out = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                node_features=batch["node_features"],
+                adj=batch["adj"],
+                training=False,
+            )
+            eps_cert = out["eps_cert"]
+            certified_count += (eps_cert > eps_threshold).sum().item()
+            total += eps_cert.shape[0]
+
+    return certified_count / total
+
+
+def main():
+    args = parse_args()
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    print(f"\nEvaluating RADAR-Net on {args.dataset.upper()}")
+    print(f"Checkpoint: {args.checkpoint}")
+
+    # Load model
+    model = RADARNet().to(device)
+    model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+    model.eval()
+
+    test_loader = get_dataloader(args.dataset, split="test", batch_size=32)
+
+    results = {"dataset": args.dataset, "checkpoint": args.checkpoint}
+
+    # Clean evaluation
+    print("\n[1/3] Clean accuracy...")
+    clean_metrics = evaluate_clean(model, test_loader, device)
+    results["clean"] = clean_metrics
+    print(f"  ACC: {clean_metrics['accuracy']:.4f} | "
+          f"F1: {clean_metrics['macro_f1']:.4f}")
+
+    # Adversarial evaluation
+    attack_names = (
+        list(ATTACK_REGISTRY.keys()) if args.attacks == "all"
+        else [a.strip() for a in args.attacks.split(",")]
+    )
+
+    print(f"\n[2/3] Adversarial accuracy ({len(attack_names)} attacks)...")
+    results["adversarial"] = {}
+    adv_accs = []
+
+    for atk_name in attack_names:
+        if atk_name not in ATTACK_REGISTRY:
+            print(f"  Unknown attack: {atk_name}, skipping")
+            continue
+        attack = ATTACK_REGISTRY[atk_name](device=device)
+        metrics = evaluate_adversarial(model, test_loader, attack, device)
+        results["adversarial"][atk_name] = metrics
+        adv_accs.append(metrics["accuracy"])
+        print(f"  {atk_name:15s}: ADV-ACC = {metrics['accuracy']:.4f}")
+
+    if adv_accs:
+        avg_adv = sum(adv_accs) / len(adv_accs)
+        results["avg_adv_acc"] = avg_adv
+        results["acc_drop"] = clean_metrics["accuracy"] - avg_adv
+        print(f"\n  Avg ADV-ACC: {avg_adv:.4f} | ACC-Drop: {results['acc_drop']:.4f}")
+
+    # Certified robustness
+    if args.crr:
+        print(f"\n[3/3] Certified Robustness Rate (ε={args.eps_threshold})...")
+        crr = evaluate_crr(model, test_loader, args.eps_threshold, device)
+        results["crr"] = crr
+        results["eps_threshold"] = args.eps_threshold
+        print(f"  CRR: {crr:.4f} ({crr*100:.1f}%)")
+
+    # Save results
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    with open(args.output, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
