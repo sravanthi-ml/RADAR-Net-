@@ -1,0 +1,68 @@
+"""
+Reproduce RADAR-Net paper results.
+Usage: python scripts/reproduce.py --table 4
+       python scripts/reproduce.py --table all
+"""
+
+import argparse
+import pandas as pd
+import os
+
+RESULTS_DIR = "results/tables"
+
+TABLES = {
+    4: "table4_clean_accuracy.csv",
+    5: "table5_adversarial_accuracy.csv",
+    6: "table6_certified_robustness.csv",
+    7: "table7_ablation.csv",
+    8: "table8_sensitivity.csv",
+    9: "table9_cross_dataset.csv",
+}
+
+TABLE_DESCRIPTIONS = {
+    4: "Clean accuracy and Macro-F1 across four datasets",
+    5: "Adversarial accuracy under five attack scenarios",
+    6: "Certified robustness (CRR) comparison",
+    7: "Ablation study — HATM component contributions",
+    8: "Sensitivity analysis — sigma_target hyperparameter",
+    9: "Cross-dataset transfer results",
+}
+
+
+def display_table(table_num: int):
+    path = os.path.join(RESULTS_DIR, TABLES[table_num])
+    if not os.path.exists(path):
+        print(f"Results file not found: {path}")
+        print("Run evaluation first: bash scripts/reproduce_all.sh")
+        return
+
+    df = pd.read_csv(path)
+    print(f"\n{'='*70}")
+    print(f"Table {table_num}: {TABLE_DESCRIPTIONS[table_num]}")
+    print(f"{'='*70}")
+    print(df.to_string(index=False))
+
+    # Highlight RADAR-Net row
+    radar_row = df[df["model"] == "RADAR-Net"]
+    if not radar_row.empty:
+        print(f"\nRADAR-Net results:")
+        for col in df.columns[1:]:
+            if col in radar_row.columns:
+                print(f"  {col}: {radar_row[col].values[0]}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--table", type=str, default="all",
+                        help="Table number to display (4-9 or 'all')")
+    args = parser.parse_args()
+
+    if args.table == "all":
+        for t in TABLES:
+            display_table(t)
+    else:
+        display_table(int(args.table))
+
+
+if __name__ == "__main__":
+    main()
